@@ -1,49 +1,69 @@
+# Python project configuration for gpt-oss
+# This file defines the package metadata, dependencies, and build system configuration
+# for the gpt-oss inference library implementing OpenAI's open-weight models.
+
 [project]
 name = "gpt-oss"
 description = "A collection of reference inference implementations for gpt-oss by OpenAI"
 
+# Core dependencies required for basic functionality
 dependencies = [
-  "openai-harmony",
-  "tiktoken>=0.9.0",
-  "aiohttp>=3.12.14",
-  "chz>=0.3.0",
-  "docker>=7.1.0",
-  "fastapi>=0.116.1",
-  "html2text>=2025.4.15",
-  "lxml>=4.9.4",
-  "pydantic>=2.11.7",
-  "structlog>=25.4.0",
-  "tenacity>=9.1.2",
-  "uvicorn>=0.35.0",
-  "requests>=2.31.0",
-  "termcolor",
-  "jupyter-client>=8.6.3",
+  "openai-harmony",              # Harmony format for structured responses
+  "tiktoken>=0.9.0",             # Tokenization (o200k_base with extensions)
+  "aiohttp>=3.12.14",            # Async HTTP for API server
+  "chz>=0.3.0",                  # HTTP/2 client for streaming
+  "docker>=7.1.0",               # Container execution for Python tool
+  "fastapi>=0.116.1",            # Responses API server framework
+  "html2text>=2025.4.15",        # HTML to markdown conversion for browser tool
+  "lxml>=4.9.4",                 # XML/HTML parsing for browser tool
+  "pydantic>=2.11.7",            # Data validation and API schemas
+  "structlog>=25.4.0",           # Structured logging
+  "tenacity>=9.1.2",             # Retry logic with exponential backoff
+  "uvicorn>=0.35.0",             # ASGI server for FastAPI
+  "requests>=2.31.0",            # HTTP requests
+  "termcolor",                   # Colored terminal output
+  "jupyter-client>=8.6.3",       # Stateful Jupyter notebook execution
 ]
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12"      # Python 3.12+ required for match statements and modern features
 version = "0.0.8"
 
+# Optional dependency groups for different backends and features
 [project.optional-dependencies]
+# Triton backend: optimized single-GPU inference with custom CUDA kernels
 triton = ["triton>=3.4", "safetensors>=0.5.3", "torch>=2.7.0"]
+
+# PyTorch backend: multi-GPU tensor parallel inference
 torch = ["safetensors>=0.5.3", "torch>=2.7.0"]
+
+# Metal backend: Apple Silicon GPU acceleration for macOS
 metal = ["numpy", "tqdm", "safetensors", "torch"]
+
+# Testing utilities
 test = ["pytest>=8.4.1", "httpx>=0.28.1"]
+
+# Evaluation framework for benchmarks (GPQA, AIME, HealthBench)
 eval = ["pandas", "numpy", "openai", "jinja2", "tqdm", "blobfile"]
 
+# Build system configuration
 [build-system]
 requires = ["setuptools>=68"]
-build-backend = "gpt_oss_build_backend.backend"
+build-backend = "gpt_oss_build_backend.backend"  # Custom build backend in _build/
 backend-path = ["_build"]
 
+# Package discovery configuration for setuptools
 [tool.setuptools.packages.find]
-include = ["gpt_oss*"]
+include = ["gpt_oss*"]  # Include all gpt_oss subpackages
 
+# Scikit-build configuration for compiling Metal C/C++ extensions
 [tool.scikit-build]
-cmake.source-dir = "." # pick up the root CMakeLists.txt
+cmake.source-dir = "."  # Use the root CMakeLists.txt
 cmake.args = [
-  "-DGPTOSS_BUILD_PYTHON=ON",
-  "-DCMAKE_BUILD_TYPE=Release",
-  "-DBUILD_SHARED_LIBS=OFF",
+  "-DGPTOSS_BUILD_PYTHON=ON",    # Build Python bindings
+  "-DCMAKE_BUILD_TYPE=Release",  # Optimized release build
+  "-DBUILD_SHARED_LIBS=OFF",     # Static linking for portability
 ]
+
+# Wheel packaging configuration
 [tool.scikit-build.wheel]
-packages = ["gpt_oss"] # copy the whole Python package tree
+packages = ["gpt_oss"]  # Include the entire Python package tree in the wheel

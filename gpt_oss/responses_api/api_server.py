@@ -1,3 +1,30 @@
+"""
+FastAPI server implementation for the Responses API.
+
+This module contains the core API server logic including:
+- FastAPI route handlers for /v1/responses endpoint
+- Request/response parsing and conversion
+- Streaming event generation (Server-Sent Events)
+- Integration with inference backends
+- Tool execution (web search, code interpreter)
+- Conversation management and state tracking
+
+The server implements a stateful, streaming API that:
+1. Accepts requests with messages, tools, and configuration
+2. Converts them to the Harmony message format
+3. Generates tokens incrementally via the inference backend
+4. Parses tokens back into structured responses
+5. Emits streaming events or returns complete responses
+
+Key Features:
+- Streaming and non-streaming modes
+- Multi-turn conversations with previous_response_id
+- Built-in tools: web search and code interpreter
+- User-defined function calling
+- Chain-of-thought reasoning
+- Citation tracking for web sources
+"""
+
 import os
 import datetime
 import uuid
@@ -68,12 +95,24 @@ from .types import (
     WebSearchCallItem,
 )
 
-DEFAULT_TEMPERATURE = 0.0
+DEFAULT_TEMPERATURE = 0.0  # Greedy decoding by default
 
 
 def get_reasoning_effort(
     effort: Union[Literal["low", "medium", "high"], ReasoningEffort]
 ) -> ReasoningEffort:
+    """
+    Convert string reasoning effort to ReasoningEffort enum.
+
+    Args:
+        effort: Either a ReasoningEffort enum or string ("low", "medium", "high")
+
+    Returns:
+        ReasoningEffort enum value
+
+    Raises:
+        ValueError: If the effort string is not valid
+    """
     if isinstance(effort, ReasoningEffort):
         return effort
     if effort == "low":
@@ -88,6 +127,21 @@ def get_reasoning_effort(
 def is_not_builtin_tool(
     recipient: str, treat_functions_python_as_builtin: bool = False
 ) -> bool:
+    """
+    Check if a recipient is a user-defined function (not a built-in tool).
+
+    Built-in tools include:
+    - browser.* (web search)
+    - python (code interpreter)
+    - assistant (the model itself)
+
+    Args:
+        recipient: The recipient/tool name from the message
+        treat_functions_python_as_builtin: If True, also treat "functions.python" as built-in
+
+    Returns:
+        True if this is a user-defined function that should be returned as a FunctionCallItem
+    """
     if treat_functions_python_as_builtin and recipient == "functions.python":
         return False
     return (
@@ -100,10 +154,35 @@ def is_not_builtin_tool(
 def create_api_server(
     infer_next_token: Callable[[list[int], float], int], encoding: HarmonyEncoding
 ) -> FastAPI:
+    """
+    Create and configure the FastAPI application for the Responses API.
+
+    This function creates a FastAPI app with:
+    - /v1/responses POST endpoint for generating completions
+    - Request validation with detailed error logging
+    - Response storage for multi-turn conversations
+    - Streaming and non-streaming support
+
+    Args:
+        infer_next_token: Function that generates the next token given:
+            - tokens: list[int] - current token sequence
+            - temperature: float - sampling temperature
+            - new_request: bool - whether this is a new request (optional)
+        encoding: HarmonyEncoding instance for tokenization
+
+    Returns:
+        Configured FastAPI application
+    """
     app = FastAPI()
 
     @app.exception_handler(RequestValidationError)
     async def log_validation_error(request: Request, exc: RequestValidationError):
+        """
+        Custom handler for request validation errors.
+
+        Logs the invalid request body for debugging purposes before
+        returning the standard validation error response.
+        """
         try:
             body_bytes = await request.body()
             print(
@@ -113,6 +192,10 @@ def create_api_server(
         except Exception as body_exc:
             print(f"Failed to read invalid request body: {body_exc}")
         return await request_validation_exception_handler(request, exc)
+
+    # Storage for responses to enable multi-turn conversations
+    # Maps response_id -> (original request, complete response)
+    # Used when previous_response_id is specified in a request
     responses_store: dict[str, tuple[ResponsesRequest, ResponseObject]] = {}
 
     def generate_response(
@@ -134,6 +217,38 @@ def create_api_server(
         message_ids: Optional[list[str]] = None,
         treat_functions_python_as_builtin: bool = False,
     ) -> ResponseObject:
+        """
+        Parse output tokens into a structured ResponseObject.
+
+        This function converts raw token sequences back into the structured
+        Responses API format. It:
+        1. Parses output tokens using the Harmony encoding
+        2. Identifies different message types (text, reasoning, function calls, tool calls)
+        3. Associates pre-generated IDs with each item
+        4. Handles citations from web search
+        5. Captures code outputs from code interpreter
+        6. Calculates token usage statistics
+
+        Args:
+            input_tokens: The input/prompt tokens
+            output_tokens: The generated output tokens to parse
+            request_body: The original request
+            debug_mode: If True, include debug info in metadata
+            function_call_ids: Pre-generated IDs for function calls (id, call_id tuples)
+            response_id: ID for this response
+            previous_response_id: ID of the previous response (if continuing)
+            browser_tool: Browser tool instance (if web search enabled)
+            browser_call_ids: Pre-generated IDs for web search calls
+            python_tool: Python tool instance (if code interpreter enabled)
+            python_call_ids: Pre-generated IDs for code interpreter calls
+            python_call_outputs: Captured outputs from code execution
+            reasoning_ids: Pre-generated IDs for reasoning items
+            message_ids: Pre-generated IDs for message items
+            treat_functions_python_as_builtin: Whether to treat functions.python as built-in
+
+        Returns:
+            Complete ResponseObject with parsed output items and metadata
+        """
         output = []
         error = None
         if len(output_tokens) > 0:
@@ -383,14 +498,35 @@ def create_api_server(
         )
 
     class StreamResponsesEvents:
+        """
+        Manages streaming event generation for the Responses API.
+
+        This class handles the complex process of generating incremental
+        Server-Sent Events (SSE) as tokens are produced by the inference backend.
+        It:
+        1. Calls infer_next_token repeatedly to get tokens one at a time
+        2. Uses StreamableParser to parse tokens incrementally
+        3. Generates appropriate events at each stage (delta, done, added, etc.)
+        4. Executes built-in tools (web search, code interpreter) when invoked
+        5. Manages state across multiple streaming iterations
+        6. Handles citations, annotations, and multi-part content
+
+        The streaming flow:
+        - Token-by-token generation with immediate delta events
+        - State transitions trigger item.added/done events
+        - Tool invocations pause generation, execute, then resume
+        - Final completion event with full response
+        """
+        # Reserved function names that map to the browser tool
         BROWSER_RESERVED_FUNCTIONS = {"browser.search", "browser.open", "browser.find"}
-        initial_tokens: list[int]
-        tokens: list[int]
-        output_tokens: list[int]
-        output_text: str
-        request_body: ResponsesRequest
-        request: Request
-        sequence_number: int
+
+        initial_tokens: list[int]  # Input prompt tokens
+        tokens: list[int]  # Current full token sequence (grows during generation)
+        output_tokens: list[int]  # Only the generated output tokens
+        output_text: str  # Decoded output text (for debugging)
+        request_body: ResponsesRequest  # Original request
+        request: Request  # FastAPI request object (for disconnect detection)
+        sequence_number: int  # Event sequence counter
 
         def __init__(
             self,

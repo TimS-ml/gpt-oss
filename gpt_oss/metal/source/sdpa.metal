@@ -1,3 +1,41 @@
+/*
+ * sdpa.metal
+ *
+ * Scaled Dot-Product Attention (SDPA) for transformer models.
+ * Implements the core attention mechanism: Attention(Q, K, V) = softmax(QK^T / sqrt(d)) V
+ *
+ * Attention Background:
+ * - Core mechanism in transformer architectures
+ * - Computes weighted combination of values based on query-key similarities
+ * - Scaled by sqrt(head_dim) for numerical stability
+ * - Supports multi-query attention (MQA) with grouped query heads
+ *
+ * Multi-Query Attention (MQA):
+ * - Multiple query heads share same key/value heads
+ * - Reduces KV cache size (8x in this implementation)
+ * - q_heads = 64, kv_heads = 8, ratio = 8:1
+ *
+ * Optimized SDPA Algorithm:
+ * 1. For each query token, iterate over KV cache tokens
+ * 2. Compute attention scores: QK^T (dot products)
+ * 3. Apply online softmax (streaming max and exp sum)
+ * 4. Accumulate weighted values: score * V
+ * 5. Final normalization by softmax denominator
+ *
+ * Flash Attention Techniques:
+ * - Online/streaming softmax computation (no separate pass)
+ * - Maintains running max and sum for numerical stability
+ * - Sliding window attention for long contexts
+ * - Fused operations to minimize memory traffic
+ *
+ * Key optimizations:
+ * - Processes multiple Q heads (8) per threadgroup
+ * - Simdgroup-level parallelism for dot products
+ * - Sliding window for efficient long-context handling
+ * - Fused softmax and value accumulation
+ * - Minimal KV cache reads (streaming algorithm)
+ */
+
 #include <metal_geometric>
 #include <metal_integer>
 #include <metal_math>
@@ -9,8 +47,40 @@
 #pragma METAL fp math_mode(safe)
 #pragma METAL fp contract(off)
 
-// Each threadgroup handles 8 Q heads / 1 KV head for 1 token
-
+/**
+ * gptoss_f32_sdpa_q8_d64
+ *
+ * Scaled Dot-Product Attention for 64 Q heads (8:1 MQA ratio), 64-dim heads.
+ *
+ * Thread organization:
+ * - 2D grid: X = query tokens, Y = KV head groups
+ * - Each threadgroup processes 8 Q heads for 1 KV head group
+ * - Simdgroups iterate over KV tokens (sliding window)
+ *
+ * Memory layout:
+ * - Q: [tokens * q_heads * head_dim] - Query projections
+ * - KV: [kv_heads * max_tokens * 2 * head_dim] - KV cache (K and V interleaved)
+ * - Output: [tokens * q_heads * head_dim] - Attention output
+ *
+ * Online Softmax Algorithm:
+ * - Maintains running max (m) and sum of exp (l) for each Q head
+ * - For each new KV token: update max, rescale previous sums, add new exp
+ * - Enables streaming computation without storing all scores
+ *
+ * Sliding Window:
+ * - Processes only recent KV tokens (window size configurable)
+ * - Efficient for long sequences (don't need full O(n^2) attention)
+ *
+ * Parameters:
+ * @param args       Configuration (qkv_dim, kv_stride, window, num_kv_tokens)
+ * @param q          Query tensor [tokens * q_heads * head_dim]
+ * @param kv         KV cache [kv_heads * max_tokens * 2 * head_dim]
+ * @param s          Attention scale factors per head
+ * @param output     Attention output [tokens * q_heads * head_dim]
+ * @param control    Control structure for early termination
+ * @param gid        2D threadgroup position (X: query token, Y: KV head)
+ * @param tid        2D thread position within threadgroup
+ */
 kernel void gptoss_f32_sdpa_q8_d64(
     constant gptoss_sdpa_args& args [[ buffer(0) ]],
     const device float* q [[ buffer(1) ]],

@@ -1,3 +1,57 @@
+"""
+Simple Browser Tool Implementation
+
+This module implements the SimpleBrowserTool, which provides web browsing
+capabilities to the model through a stateful interface supporting search,
+navigation, and in-page text search.
+
+Core Functionality:
+-------------------
+1. search(query): Search the web and display results
+2. open(id): Open a link from search results or navigate to a URL
+3. find(pattern): Search for text within the current page
+
+The tool maintains a browsing state with history (page_stack) and uses a
+citation system that allows the model to reference specific pages and
+line numbers in its responses.
+
+Citation System:
+----------------
+The browser uses special Unicode brackets 【】 to mark citations:
+- In page content: 【0†Link Text†domain.com】 marks a clickable link
+- In model output: 【6†L9-L11】 cites lines 9-11 from page at cursor 6
+
+The cursor is an index into the browsing history (page_stack), allowing
+the model to reference previously visited pages.
+
+State Management:
+-----------------
+SimpleBrowserState maintains:
+- pages: Dict mapping URLs to PageContents
+- page_stack: Sequential list of visited URLs (the browsing history)
+- current_cursor: Index of the current page in the stack
+
+This stateful design enables:
+- Back/forward navigation (by referencing different cursors)
+- Citation tracking across multiple pages
+- Avoiding re-fetching pages
+
+Integration with Harmony Format:
+---------------------------------
+The tool follows the function-calling pattern where:
+- message.recipient = "browser.search" or "browser.open" or "browser.find"
+- message.content contains JSON arguments
+- Tool yields Message objects with browsing results
+
+Tokenization and Pagination:
+-----------------------------
+The tool uses tiktoken to limit how much text is shown at once:
+- Pages are wrapped to 80 characters per line
+- Line numbers are added for citation purposes
+- view_tokens parameter controls how many tokens to display
+- The model can scroll through pages by calling open() with different loc parameters
+"""
+
 import contextvars
 import dataclasses
 import functools
@@ -34,41 +88,81 @@ from .page_contents import Extract, PageContents
 
 logger = structlog.stdlib.get_logger(component=__name__)
 
-
-# TODO(zhuohan): Use the correct encoding at release
+# Tokenizer encoding name (TODO: Update at release if needed)
 ENC_NAME = "o200k_base"
+
+# Format for displaying find results with citation markers
 FIND_PAGE_LINK_FORMAT = "# 【{idx}†{title}】"
-PARTIAL_INITIAL_LINK_PATTERN = re.compile(r"^[^【】]*】")
-PARTIAL_FINAL_LINK_PATTERN = re.compile(
+
+# Regex patterns for detecting and cleaning citation markers
+PARTIAL_INITIAL_LINK_PATTERN = re.compile(r"^[^【】]*】")  # Incomplete citation at start
+PARTIAL_FINAL_LINK_PATTERN = re.compile(  # Incomplete citation at end
     r"【\d*(?:†(?P<content>[^†】]*)(?:†[^†】]*)?)?$"
 )
-LINK_PATTERN = re.compile(r"【\d+†(?P<content>[^†】]+)(?:†[^†】]+)?】")
+LINK_PATTERN = re.compile(r"【\d+†(?P<content>[^†】]+)(?:†[^†】]+)?】")  # Complete citation
 
+# Pattern for parsing citations in model output
 CITATION_OUTPUT_PATTERN = re.compile(r"【(?P<cursor>\d+)†(?P<content>[^†】]+)(?:†[^†】]+)?】")
 
 CallParams = ParamSpec("CallParams")
 
-
 _P = ParamSpec("_P")
+# Context variable to track which function is currently executing (for message authorship)
 _live_function_name = contextvars.ContextVar[str]("_live_function_name")
 
 
 class ToolUsageError(Exception):
+    """
+    Raised when the model uses the browser tool incorrectly.
+
+    Examples:
+    - Trying to access a cursor that doesn't exist
+    - Running find() on a search results page
+    - Invalid link IDs
+    - Invalid location parameters
+
+    These errors are caught and returned as error messages to the model,
+    allowing it to correct its usage.
+    """
     pass
 
 
 def function_the_model_can_call(
     fn: Callable[_P, AsyncIterator[Message]],
 ) -> Callable[_P, AsyncIterator[Message]]:
+    """
+    Decorator for browser functions that the model can invoke.
+
+    This decorator:
+    1. Marks the function as callable by the model
+    2. Sets a context variable with the function name during execution
+    3. Ensures proper authorship attribution in response messages
+
+    The context variable _live_function_name is used by make_response() to
+    construct the message author as "browser.{function_name}".
+
+    Args:
+        fn: An async generator function that yields Messages
+
+    Returns:
+        Wrapped function with context tracking
+
+    Usage:
+        @function_the_model_can_call
+        async def search(self, query: str) -> AsyncIterator[Message]:
+            ...
+    """
     fn.__fn_calling_tool_fn_type__ = "function_the_model_can_call"  # type: ignore
 
     @functools.wraps(fn)
     async def inner(*args: _P.args, **kwargs: _P.kwargs) -> AsyncIterator[Message]:
+        # Set context variable for message authorship
         token = _live_function_name.set(fn.__name__)
         try:
             async for m in fn(*args, **kwargs):
                 yield m
         finally:
+            # Always clean up the context variable
             _live_function_name.reset(token)
 
     return inner
@@ -275,23 +369,76 @@ def handle_errors(
 
 
 class SimpleBrowserState(pydantic.BaseModel):
-    # maps page url to page contents
+    """
+    Maintains the browsing state and history for SimpleBrowserTool.
+
+    This class tracks all pages that have been visited during a browsing session
+    and provides a "cursor" abstraction for referencing them. The cursor is
+    simply an index into the page_stack.
+
+    State Components:
+    -----------------
+    - pages: Cache of PageContents objects by URL (avoids re-fetching)
+    - page_stack: Ordered history of visited URLs (the browsing timeline)
+    - current_cursor: Index of the most recently visited page
+
+    The page_stack enables:
+    - Citation tracking: 【6†L9-L11】 refers to page at cursor 6
+    - Back navigation: The model can reference earlier pages by cursor
+    - Deduplication: Same URL can appear multiple times if revisited
+
+    Attributes:
+        pages: Dict mapping URLs to their PageContents
+        page_stack: List of URLs in visit order
+    """
+    # Maps page URL to page contents
     pages: dict[str, PageContents] = pydantic.Field(default_factory=dict)
-    # a sequential list of page urls
+    # Sequential list of page URLs (browsing history)
     page_stack: list[str] = pydantic.Field(default_factory=list)
 
     @property
     def current_cursor(self) -> int:
+        """
+        Returns the cursor index of the current page.
+
+        Returns:
+            Index of the most recent page in page_stack (len - 1)
+        """
         return len(self.page_stack) - 1
 
     def add_page(self, page: PageContents) -> None:
+        """
+        Add a page to the browsing history.
+
+        Args:
+            page: The PageContents to add
+
+        This both caches the page and appends its URL to the history stack.
+        If the same URL is visited multiple times, it will appear multiple
+        times in the stack.
+        """
         self.pages[page.url] = page
         self.page_stack.append(page.url)
 
     def get_page(self, cursor: int = -1) -> PageContents:
+        """
+        Retrieve a page by its cursor index.
+
+        Args:
+            cursor: Index in page_stack (-1 for current page)
+
+        Returns:
+            The PageContents at that cursor
+
+        Raises:
+            ToolUsageError: If no pages exist or cursor is invalid
+
+        The model uses this to access previously visited pages for citations.
+        """
         if self.current_cursor < 0:
             raise ToolUsageError("No pages to access!")
         if cursor == -1 or cursor == self.current_cursor:
+            # Default to current page
             return self.pages[self.page_stack[-1]]
         try:
             page_url = self.page_stack[cursor]
@@ -307,16 +454,72 @@ class SimpleBrowserState(pydantic.BaseModel):
         return self.pages[page_url]
 
     def get_page_by_url(self, url: str) -> PageContents | None:
+        """
+        Look up a cached page by URL.
+
+        Args:
+            url: The page URL
+
+        Returns:
+            PageContents if cached, None otherwise
+
+        Used to avoid re-fetching pages that were already visited.
+        """
         if url in self.pages:
             return self.pages[url]
         return None
 
     def pop_page_stack(self) -> None:
+        """
+        Remove the most recent page from the stack.
+
+        Used for error recovery when a page fails to load properly.
+        """
         assert self.current_cursor >= 0, "No page to pop!"
         self.page_stack.pop()
 
 
 class SimpleBrowserTool(Tool):
+    """
+    Web browsing tool that enables the model to search and navigate the web.
+
+    This tool provides a stateful browsing experience with three main functions:
+    1. search(query): Search the web using a configured backend (Exa or You.com)
+    2. open(id): Open a link by ID or navigate to a URL directly
+    3. find(pattern): Search for text within the current page
+
+    Key Features:
+    -------------
+    - Stateful: Maintains browsing history via SimpleBrowserState
+    - Citations: Uses special markers 【cursor†content】 for source attribution
+    - Pagination: Shows limited tokens per page, supports scrolling
+    - Caching: Avoids re-fetching previously visited pages
+
+    Integration with Harmony:
+    -------------------------
+    The tool uses function-based routing where message.recipient determines
+    which function to call:
+    - "browser.search" → search()
+    - "browser.open" → open()
+    - "browser.find" → find()
+
+    The message content contains JSON-encoded arguments.
+
+    Configuration:
+    --------------
+    - backend: Backend instance (ExaBackend or YouComBackend)
+    - encoding_name: Tokenizer to use for pagination
+    - max_search_results: Maximum search results to return
+    - view_tokens: How many tokens to show per page view
+    - tool_state: Optional initial state (for restoring sessions)
+
+    Attributes:
+        backend: The Backend instance for search/fetch operations
+        tool_state: The SimpleBrowserState tracking browsing history
+        encoding_name: Name of the tiktoken encoding for tokenization
+        max_search_results: Max number of search results
+        view_tokens: Token limit for page views
+    """
     def __init__(
         self,
         backend: Backend,
@@ -326,11 +529,23 @@ class SimpleBrowserTool(Tool):
         view_tokens: int = 1024,
         name: str = "browser",
     ):
+        """
+        Initialize the SimpleBrowserTool.
+
+        Args:
+            backend: Backend instance for web operations (ExaBackend or YouComBackend)
+            encoding_name: Tokenizer encoding name for pagination
+            max_search_results: Maximum number of search results to return
+            tool_state: Optional state dict to restore a previous session
+            view_tokens: Number of tokens to show per page view (for pagination)
+            name: Tool name (must be "browser")
+        """
         assert name == "browser"
         self.backend = backend
         if tool_state is None:
             self.tool_state = SimpleBrowserState()
         else:
+            # Restore state from dict (for session persistence)
             self.tool_state = SimpleBrowserState.model_validate(tool_state)
 
         self.encoding_name = encoding_name
@@ -460,10 +675,42 @@ sources=""" + self.backend.source
         top_n: int = 10,
         source: str | None = None,
     ) -> AsyncIterator[Message]:
-        del topn
-        del top_n
+        """
+        Search the web and return results as a browsable page.
+
+        This function:
+        1. Calls the backend's search API with the query
+        2. Receives a PageContents object with numbered links
+        3. Adds the search results page to the browsing history
+        4. Displays the page to the model
+
+        The search results page contains links like 【0†Page Title†domain.com】
+        that the model can click using open(id=0).
+
+        Args:
+            query: The search query string
+            topn: Ignored (for backward compatibility)
+            top_n: Ignored (for backward compatibility)
+            source: Ignored (for backward compatibility)
+
+        Yields:
+            Message containing the search results page with numbered links
+
+        Raises:
+            BackendError: If the search API call fails
+
+        Example:
+            Model sends: {"query": "Python asyncio tutorial"}
+            Tool returns: Page with links:
+                【0†Asyncio Tutorial - Real Python†realpython.com】
+                【1†asyncio — Asynchronous I/O†docs.python.org】
+                ...
+        """
+        del topn  # Unused, kept for compatibility
+        del top_n  # Unused, kept for compatibility
         try:
             async with ClientSession() as session:
+                # Call backend to perform the search
                 search_page = await self.backend.search(
                     query=query,
                     topn=self.max_search_results,
@@ -473,7 +720,10 @@ sources=""" + self.backend.source
             msg = maybe_truncate(str(e))
             raise BackendError(f"Error during search for `{query}`: {msg}") from e
 
+        # Add search results to browsing history
         self.tool_state.add_page(search_page)
+
+        # Display the search results page
         yield await self.show_page_safely(loc=0)
 
     @function_the_model_can_call
@@ -487,6 +737,47 @@ sources=""" + self.backend.source
         view_source: bool = False,
         source: str | None = None,
     ) -> AsyncIterator[Message]:
+        """
+        Open a link or navigate to a specific location on a page.
+
+        This versatile function handles several navigation scenarios:
+        1. Open a link by ID: open(id=0) - opens link 【0†...】 from current page
+        2. Open a URL directly: open(id="https://example.com")
+        3. Scroll on current page: open(loc=100) - jump to line 100
+        4. View a previous page: open(cursor=5, loc=50) - page 5, line 50
+        5. View page source: open(id=0, view_source=True)
+
+        Args:
+            id: Link ID (int) to click, or URL (str) to visit directly
+            cursor: Which page in history to reference (default: current page)
+            loc: Line number to start displaying from (default: 0 or snippet location)
+            num_lines: Number of lines to show (default: auto based on view_tokens)
+            view_source: If True, show raw HTML instead of processed text
+            source: Ignored (for backward compatibility)
+
+        Yields:
+            Message containing the opened page content with line numbers
+
+        Raises:
+            ToolUsageError: If the link ID or cursor is invalid
+            BackendError: If fetching the URL fails
+
+        Examples:
+            # Click first link from search results
+            open(id=0)
+
+            # Visit URL directly
+            open(id="https://python.org")
+
+            # Scroll to line 100 on current page
+            open(loc=100)
+
+            # View line 50 on page at cursor 3
+            open(cursor=3, loc=50)
+
+            # View raw HTML source
+            open(id=0, view_source=True)
+        """
         curr_page: PageContents | None = None
         stay_on_current_page = False
         direct_url_open = False
@@ -536,6 +827,47 @@ sources=""" + self.backend.source
     @function_the_model_can_call
     @handle_errors
     async def find(self, pattern: str, cursor: int = -1) -> AsyncIterator[Message]:
+        """
+        Search for text within the current page.
+
+        This function searches for a case-insensitive pattern within the current
+        (or specified) page and returns a new page showing all matches with
+        their surrounding context.
+
+        Each match is displayed with:
+        - A numbered citation marker: 【0†match at L10】
+        - 4 lines of context showing the match
+
+        The model can then open specific matches or cite them in responses.
+
+        Args:
+            pattern: Text pattern to search for (case-insensitive)
+            cursor: Which page to search (default: current page)
+
+        Yields:
+            Message with a find results page containing numbered matches
+
+        Raises:
+            ToolUsageError: If trying to run find on a search results or find results page
+            ToolUsageError: If cursor is invalid
+
+        Example:
+            # Search for "async" in the current page
+            find(pattern="async")
+
+            Tool returns page like:
+            【0†match at L15】
+            ...context around first match...
+
+            【1†match at L42】
+            ...context around second match...
+
+        Note:
+            - Cannot run find() on search results pages (those are for browsing)
+            - Cannot run find() on previous find results (would be recursive)
+            - Pattern matching is case-insensitive
+            - Shows up to 50 matches
+        """
         page = self.tool_state.get_page(cursor)
         if page.snippets is not None:
             raise ToolUsageError(

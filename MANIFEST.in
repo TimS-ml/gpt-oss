@@ -1,1 +1,7 @@
-recursive-include _build * 
+# Manifest file for including additional files in the Python distribution package
+# This ensures that the custom build backend is included when the package is distributed
+
+# Include all files from the _build directory (contains custom build backend)
+# This is necessary because the build system uses a custom backend defined in
+# _build/gpt_oss_build_backend/backend.py
+recursive-include _build *

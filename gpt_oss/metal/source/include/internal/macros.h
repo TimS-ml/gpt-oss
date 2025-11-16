@@ -1,3 +1,25 @@
+/**
+ * @file macros.h
+ * @brief Compiler and architecture portability macros for GPT-OSS
+ *
+ * This header provides preprocessor macros for:
+ * - Architecture detection (x86-64, ARM64)
+ * - Compiler-specific optimizations (branch prediction hints, inlining)
+ * - Structure packing and alignment control
+ * - Symbol visibility control
+ *
+ * These macros abstract away compiler and platform differences, enabling
+ * portable code that can leverage platform-specific optimizations when
+ * available.
+ *
+ * Architecture support:
+ * - x86-64 (Intel/AMD 64-bit)
+ * - ARM64 (ARMv8-A, Apple Silicon)
+ *
+ * Compiler support:
+ * - GCC/Clang (primary)
+ * - MSVC (partial)
+ */
 #pragma once
 
 /***** Architecture detection macros *****/

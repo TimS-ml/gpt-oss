@@ -1,8 +1,24 @@
+"""
+Stub inference backend for testing the Responses API.
+
+This backend returns pre-defined token sequences instead of performing
+actual inference. Useful for:
+- Testing the API without a model
+- Development and debugging
+- Demonstrations
+- Validating request/response parsing
+
+The stub backend cycles through a hardcoded token sequence that represents
+a simple Q&A interaction in the Harmony tokenization format.
+"""
+
 import time
 from typing import Callable
 
+# Predefined token sequences (see comments in utils.py for details)
+# These represent complete conversations in the Harmony format
 fake_tokens = [
-    200005,
+    200005,  # Start message
     35644,
     200008,
     23483,
@@ -36,8 +52,10 @@ fake_tokens = [
     28499,
     18826,
     18583,
-    200012,
+    200012,  # End of sequence
 ]
+
+# Active sequence: Simple "1 + 1 = 2" response
 fake_tokens = [
     200005,
     35644,
@@ -124,19 +142,45 @@ fake_tokens = [
 #     198,
 # ]
 
+# Global queue of tokens - cycles through fake_tokens repeatedly
 token_queue = fake_tokens.copy()
 
 
 def stub_infer_next_token(
     tokens: list[int], temperature: float = 0.0, new_request: bool = False
 ) -> int:
+    """
+    Stub token generation function.
+
+    Returns pre-defined tokens from fake_tokens one at a time, cycling
+    through the array repeatedly. Simulates generation latency with a
+    small sleep delay.
+
+    Args:
+        tokens: Current token sequence (ignored by stub)
+        temperature: Sampling temperature (ignored by stub)
+        new_request: Whether this is a new request (ignored by stub)
+
+    Returns:
+        Next token from the fake_tokens sequence
+    """
     global token_queue
     next_tok = token_queue.pop(0)
+    # Reset queue when exhausted to cycle through tokens
     if len(token_queue) == 0:
         token_queue = fake_tokens.copy()
-    time.sleep(0.1)
+    time.sleep(0.1)  # Simulate generation delay (100ms per token)
     return next_tok
 
 
 def setup_model(_checkpoint: str) -> Callable[[list[int], float], int]:
+    """
+    Initialize the stub backend.
+
+    Args:
+        _checkpoint: Model checkpoint path (ignored by stub)
+
+    Returns:
+        Stub inference function that returns pre-defined tokens
+    """
     return stub_infer_next_token

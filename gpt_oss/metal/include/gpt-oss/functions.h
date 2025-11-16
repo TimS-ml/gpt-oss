@@ -1,3 +1,38 @@
+/**
+ * @file functions.h
+ * @brief Public API functions for the GPT-OSS library
+ *
+ * This header declares all public C API functions for GPT-OSS, organized by object type:
+ *
+ * Model Functions:
+ * - gptoss_model_create_from_file(): Load model from file
+ * - gptoss_model_get_tokenizer(): Access associated tokenizer
+ * - gptoss_model_get_max_context_length(): Query context capacity
+ * - gptoss_model_retain()/release(): Reference counting
+ *
+ * Tokenizer Functions:
+ * - gptoss_tokenizer_get_special_token_id(): Query special token IDs
+ * - gptoss_tokenizer_get_num_*_tokens(): Query vocabulary sizes
+ * - gptoss_tokenizer_decode(): Convert token ID to bytes
+ * - gptoss_tokenizer_retain()/release(): Reference counting
+ *
+ * Context Functions:
+ * - gptoss_context_create(): Create inference context
+ * - gptoss_context_append_chars()/append_tokens(): Add input
+ * - gptoss_context_process(): Run model inference
+ * - gptoss_context_sample(): Sample next token
+ * - gptoss_context_get_*(): Query context state
+ * - gptoss_context_reset(): Clear context state
+ * - gptoss_context_retain()/release(): Reference counting
+ *
+ * Sampler Functions:
+ * - gptoss_sampler_create(): Create sampler configuration
+ * - gptoss_sampler_set_*(): Configure sampling parameters
+ * - gptoss_sampler_retain()/release(): Reference counting
+ *
+ * All functions return gptoss_status to indicate success/failure.
+ * All objects use reference counting for automatic memory management.
+ */
 #pragma once
 
 #include <stddef.h>
