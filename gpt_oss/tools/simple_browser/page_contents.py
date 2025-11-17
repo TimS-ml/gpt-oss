@@ -1,5 +1,63 @@
 """
-Page contents for the simple browser tool.
+Page Contents Processing for Simple Browser Tool
+
+This module handles the conversion of raw HTML into model-readable text format.
+It's responsible for extracting content, processing links, handling images,
+and creating the special citation format that the model uses.
+
+Key Transformations:
+--------------------
+1. HTML → Clean Text:
+   - Removes scripts, styles, and other non-content elements
+   - Converts HTML to markdown-like plaintext
+   - Preserves structure while being token-efficient
+
+2. Link Processing:
+   - Extracts all <a href="..."> tags
+   - Replaces them with numbered markers: 【0†Link Text†domain.com】
+   - Creates a mapping from numbers to URLs
+   - Handles relative URLs by converting to absolute
+
+3. Image Handling:
+   - Replaces <img> tags with placeholders: [Image 0: alt text]
+   - Preserves alt text for context
+
+4. Special Character Handling:
+   - Replaces certain characters that might confuse the model
+   - Removes zero-width spaces and other invisible characters
+   - Handles math symbols and subscripts/superscripts
+
+Citation Format:
+----------------
+Links in HTML are converted to a special bracket notation that enables
+citations. For example:
+
+    <a href="https://example.com/page">Read more</a>
+
+Becomes:
+
+    【0†Read more†example.com】
+
+Where:
+- 0 is the link ID
+- "Read more" is the visible text
+- "example.com" is the domain (only shown for external links)
+
+This format allows the model to cite sources in its responses using the same
+notation, creating traceable attributions.
+
+Classes:
+--------
+- Extract: Represents a search result snippet or quotable text section
+- FetchResult: Result of fetching a URL (success/failure with metadata)
+- PageContents: Final processed representation of a web page
+
+Functions:
+----------
+- process_html(): Main entry point for HTML → PageContents conversion
+- html_to_text(): Converts HTML to clean plaintext
+- _clean_links(): Processes all links and generates the citation format
+- replace_images(): Handles image tag replacements
 """
 
 from __future__ import annotations
@@ -30,7 +88,19 @@ EMPTY_LINE_RE = re.compile(r"^\s+$", flags=re.MULTILINE)
 EXTRA_NEWLINE_RE = re.compile(r"\n(\s*\n)+")
 
 
-class Extract(pydantic.BaseModel):  # A search result snippet or a quotable extract
+class Extract(pydantic.BaseModel):
+    """
+    Represents a snippet of text from a web page (e.g., search result or find result).
+
+    Extracts are used when displaying search results or find-in-page results.
+    They contain a small piece of text along with metadata about where it came from.
+
+    Attributes:
+        url: The URL where this text was found
+        text: The extracted text snippet
+        title: A title for this extract (e.g., "#0" for find results)
+        line_idx: Optional line number where this text appears in the page
+    """
     url: str
     text: str
     title: str
@@ -38,6 +108,22 @@ class Extract(pydantic.BaseModel):  # A search result snippet or a quotable extr
 
 
 class FetchResult(pydantic.BaseModel):
+    """
+    Result of attempting to fetch a web page.
+
+    This is an intermediate representation that captures success/failure
+    along with the retrieved content or error information.
+
+    Attributes:
+        url: The URL that was fetched
+        success: Whether the fetch succeeded
+        title: Page title (if available)
+        error_type: Type of error if fetch failed
+        error_message: Error details if fetch failed
+        html: Raw HTML if successful
+        raw_content: Raw bytes if content isn't HTML
+        plaintext: Extracted text content
+    """
     url: str
     success: bool
     title: str | None = None
@@ -49,6 +135,23 @@ class FetchResult(pydantic.BaseModel):
 
 
 class PageContents(pydantic.BaseModel):
+    """
+    Processed representation of a web page ready for the model.
+
+    This is the final output of HTML processing, containing clean text
+    with numbered link markers and metadata.
+
+    Attributes:
+        url: The page URL
+        text: Processed text content with link markers
+        title: Page title
+        urls: Mapping from link IDs (as strings) to URLs
+        snippets: Optional mapping from IDs to Extract objects (for search/find results)
+        error_message: Error information if page couldn't be fully processed
+
+    The text field contains special markers like 【0†Link Text†domain.com】 that
+    reference entries in the urls dict. This enables citation tracking.
+    """
     url: str
     text: str
     title: str
@@ -257,44 +360,94 @@ def process_html(
     session: aiohttp.ClientSession | None = None,
     display_urls: bool = False,
 ) -> PageContents:
-    """Convert HTML into model-readable version."""
+    """
+    Convert raw HTML into a model-readable PageContents object.
+
+    This is the main entry point for HTML processing. It orchestrates all the
+    transformation steps to convert HTML into clean, citation-friendly text.
+
+    Processing Pipeline:
+    1. Remove problematic Unicode characters (Supplementary Multilingual Plane)
+    2. Replace special characters that might confuse the model
+    3. Parse HTML into an lxml tree
+    4. Extract and process all links with citation markers
+    5. Replace images with placeholders
+    6. Remove math elements (not well supported)
+    7. Convert to plaintext while preserving structure
+    8. Clean up whitespace and formatting
+
+    Args:
+        html: Raw HTML string
+        url: The page URL (used for resolving relative links)
+        title: Optional explicit title (otherwise extracted from <title> tag)
+        session: Optional aiohttp session (for potential future use)
+        display_urls: Whether to show the URL at the top of the text
+
+    Returns:
+        PageContents object with:
+        - Processed text with citation markers
+        - Mapping of link IDs to URLs
+        - Page title and metadata
+
+    Example:
+        >>> html = '<a href="/page">Click here</a>'
+        >>> result = process_html(html, "https://example.com", None)
+        >>> print(result.text)
+        【0†Click here】
+        >>> print(result.urls)
+        {'0': 'https://example.com/page'}
+    """
+    # Remove problematic Unicode characters
     html = remove_unicode_smp(html)
+    # Replace special characters that might interfere with citation markers
     html = _replace_special_chars(html)
+    # Parse into lxml tree for manipulation
     root = lxml.html.fromstring(html)
 
-    # Parse the title.
+    # Extract or construct the page title
     title_element = root.find(".//title")
     if title:
         final_title = title
     elif title_element is not None:
         final_title = title_element.text or ""
     elif url and (domain := get_domain(url)):
-        final_title = domain
+        final_title = domain  # Fallback to domain name
     else:
         final_title = ""
 
+    # Process all links and create citation markers
     urls = _clean_links(root, url)
+
+    # Replace images with placeholders
     replace_images(
         root=root,
         base_url=url,
         session=session,
     )
+
+    # Remove math elements (they don't convert well to text)
     _remove_math(root)
+
+    # Convert the modified HTML tree to clean plaintext
     clean_html = lxml.etree.tostring(root, encoding="UTF-8").decode()
     text = html_to_text(clean_html)
-    text = re.sub(WHITESPACE_ANCHOR_RE, lambda m: m.group(2) + m.group(1), text)
-    # ^^^ move anchors to the right thru whitespace
-    # This way anchors don't create extra whitespace
-    text = re.sub(EMPTY_LINE_RE, "", text)
-    # ^^^ Get rid of empty lines
-    text = re.sub(EXTRA_NEWLINE_RE, "\n\n", text)
-    # ^^^ Get rid of extra newlines
 
+    # Post-processing: clean up whitespace and formatting
+    text = re.sub(WHITESPACE_ANCHOR_RE, lambda m: m.group(2) + m.group(1), text)
+    # ^^^ Move citation markers to the right through whitespace
+    # This prevents markers from creating extra spaces
+
+    text = re.sub(EMPTY_LINE_RE, "", text)
+    # ^^^ Remove lines that are only whitespace
+
+    text = re.sub(EXTRA_NEWLINE_RE, "\n\n", text)
+    # ^^^ Collapse multiple newlines to at most two (one blank line)
+
+    # Optionally add URL header
     top_parts = []
     if display_urls:
         top_parts.append(f"\nURL: {url}\n")
-    # NOTE: Publication date is currently not extracted due
-    # to performance costs.
+    # NOTE: Publication date is currently not extracted due to performance costs.
 
     return PageContents(
         url=url,

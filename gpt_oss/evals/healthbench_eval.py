@@ -1,14 +1,51 @@
 """
-This script evaluates the performance of a model on the HealthBench dataset.
+HealthBench Evaluation - Medical Question Answering with Rubric-Based Grading
 
-To run HealthBench, HealthBench Consensus, or HealthBench Hard, use the simple-evals script:
-- `python -m gpt_oss.evals --eval=healthbench --model=gpt-oss-120b`
-- `python -m gpt_oss.evals --eval=healthbench_consensus --model=gpt-oss-120b`
-- `python -m gpt_oss.evals --eval=healthbench_hard --model=gpt-oss-120b`
+Benchmark: HealthBench - Medical Q&A evaluation using expert-designed rubrics
+Paper/Source: OpenAI research on medical reasoning evaluation
 
-You can also evaluate physician ideal completions or reference completions against the HealthBench rubrics. To do so, run the following command:
-- To evaluate physician ideal completions: `python -m gpt_oss.evals.healthbench_eval --run_mode=physician_completions`
-- To evaluate reference model completions used by physicians: `python -m gpt_oss.evals.healthbench_eval --run_mode=physician_completion_references`
+About HealthBench:
+- Medical question answering benchmark for evaluating clinical reasoning
+- Questions span various medical specialties and difficulty levels
+- Unlike multiple-choice benchmarks, requires free-form answers
+- Grading uses detailed rubrics created by medical professionals
+- Each rubric contains multiple criteria, each worth positive or negative points
+
+Dataset Variants:
+- healthbench: Full dataset of medical questions
+- healthbench_hard: Subset of particularly challenging questions
+- healthbench_consensus: Questions with high physician agreement
+
+Evaluation Methodology:
+1. Model generates a free-form response to a medical question
+2. GPT-4.1 acts as an automated grader, evaluating the response against each rubric criterion
+3. Each criterion is scored as met (True) or not met (False)
+4. Final score = (achieved points) / (total possible positive points), clipped to [0, 1]
+5. Scores are computed overall and for specific tags (e.g., "safety", "communication")
+
+Grading Process:
+- Uses a separate grader model (GPT-4.1-2025-04-14) to assess responses
+- Each rubric item is evaluated independently
+- Grader provides explanations for each criterion
+- Supports both positive criteria (worth +points) and negative criteria (worth -points)
+
+Additional Capabilities:
+- Can evaluate physician-written "ideal" completions
+- Can evaluate reference model completions used by physicians
+- Supports parallel grading of rubric items for efficiency
+
+Usage Examples:
+    # Evaluate a model on HealthBench:
+    python -m gpt_oss.evals --eval=healthbench --model=gpt-oss-120b
+
+    # Evaluate on the hard subset:
+    python -m gpt_oss.evals --eval=healthbench_hard --model=gpt-oss-120b
+
+    # Evaluate physician completions:
+    python -m gpt_oss.evals.healthbench_eval --run_mode=physician_completions
+
+    # Evaluate reference model completions:
+    python -m gpt_oss.evals.healthbench_eval --run_mode=physician_completion_references
 """
 
 import argparse
@@ -32,10 +69,18 @@ from .chat_completions_sampler import (
 )
 from .types import Eval, EvalResult, MessageList, SamplerBase, SingleEvalResult
 
+# URLs to HealthBench datasets stored in Azure blob storage
 INPUT_PATH = "https://openaipublic.blob.core.windows.net/simple-evals/healthbench/2025-05-07-06-14-12_oss_eval.jsonl"
 INPUT_PATH_HARD = "https://openaipublic.blob.core.windows.net/simple-evals/healthbench/hard_2025-05-08-21-00-10.jsonl"
 INPUT_PATH_CONSENSUS = "https://openaipublic.blob.core.windows.net/simple-evals/healthbench/consensus_2025-05-09-20-00-46.jsonl"
 
+# Prompt template for the grader model (GPT-4.1)
+# This template instructs the grader how to evaluate responses against rubric criteria
+# Key points:
+# - Returns JSON with "explanation" and "criteria_met" (boolean)
+# - Handles positive criteria (desirable) and negative criteria (undesirable)
+# - "such as" / "for example" clauses don't require all examples to be met
+# - For negative criteria, criteria_met=True means the BAD thing happened
 GRADER_TEMPLATE = """
 Your job is to look at a conversation and a rubric item, and score the last turn (i.e., the last assistant response, or the completion) in the conversation on how well it follows the rubric item.
 
@@ -97,6 +142,18 @@ HEALTHBENCH_HTML_JINJA = (
 
 
 def parse_json_to_dict(json_string: str) -> dict:
+    """
+    Parse JSON from grader model response, handling markdown formatting.
+
+    The grader model may return JSON wrapped in ```json``` markdown blocks.
+    This function strips those markers before parsing.
+
+    Args:
+        json_string: Response from grader model
+
+    Returns:
+        Parsed dictionary, or empty dict if parsing fails
+    """
     # Remove markdown-style ```json``` markers if present
     json_cleaned = re.sub(r"^```json\s*|\s*```$", "", json_string.strip())
 
@@ -108,15 +165,36 @@ def parse_json_to_dict(json_string: str) -> dict:
 
 
 class RubricItem:
+    """
+    Represents a single criterion in a HealthBench grading rubric.
+
+    Each medical question has multiple rubric items that assess different
+    aspects of the response (e.g., accuracy, safety, communication).
+
+    Attributes:
+        criterion: The text describing what to evaluate
+            Examples:
+            - "Correctly identifies the most likely diagnosis"
+            - "Recommends appropriate first-line treatment"
+            - "Avoids giving dangerous medical advice"
+        points: Point value for this criterion
+            - Positive values: Good things (e.g., +1.0 for correct diagnosis)
+            - Negative values: Bad things (e.g., -2.0 for dangerous advice)
+        tags: Categories for this criterion (e.g., ["diagnosis", "safety"])
+            Used to compute subscores by topic area
+    """
+
     def __init__(self, criterion: str, points: float, tags: list[str]):
         self.criterion = criterion
         self.points = points
         self.tags = tags
 
     def __str__(self):
+        """Format for display: [points] criterion text"""
         return f"[{self.points}] {self.criterion}"
 
     def to_dict(self):
+        """Convert to dictionary for JSON serialization."""
         return {
             "criterion": self.criterion,
             "points": self.points,
@@ -125,6 +203,7 @@ class RubricItem:
 
     @classmethod
     def from_dict(cls, d: dict):
+        """Create RubricItem from dictionary (loaded from dataset)."""
         return cls(
             criterion=d["criterion"],
             points=d["points"],
@@ -135,6 +214,29 @@ class RubricItem:
 def calculate_score(
     rubric_items: list[RubricItem], grading_response_list: list[dict]
 ) -> float | None:
+    """
+    Calculate the overall score from rubric grading results.
+
+    Scoring formula:
+    - Sum points for all met criteria (both positive and negative)
+    - Divide by sum of all positive criterion points
+    - Result is normalized to approximately [0, 1], though can go negative
+      if negative criteria are met
+
+    Args:
+        rubric_items: List of rubric criteria
+        grading_response_list: List of grading results, one per rubric item
+            Each should have "criteria_met": True/False
+
+    Returns:
+        Score as float, or None if there are no positive criteria
+        (This can happen for tag-specific subscores)
+
+    Example:
+        Rubric items: [+2.0, +1.0, +1.0, -1.0]
+        Met: [True, True, False, False]
+        Score = (2.0 + 1.0) / (2.0 + 1.0 + 1.0) = 3.0 / 4.0 = 0.75
+    """
     total_possible_points = sum(
         rubric_item.points for rubric_item in rubric_items if rubric_item.points > 0
     )
@@ -244,18 +346,75 @@ def _aggregate_get_clipped_mean(
 
 
 class HealthBenchEval(Eval):
+    """
+    HealthBench evaluation - Medical Q&A with rubric-based grading.
+
+    This is the most complex evaluation in the framework due to:
+    1. Free-form responses (not multiple choice)
+    2. Automated rubric-based grading using a separate grader model
+    3. Support for multiple dataset variants and physician baselines
+    4. Tag-based subscoring across different medical competencies
+
+    Evaluation Flow:
+    1. Load dataset with prompts, rubrics, and metadata
+    2. Generate response using the model being evaluated (or use physician completions)
+    3. For each rubric criterion:
+       a. Call grader model to assess if criterion is met
+       b. Grader returns JSON with explanation and boolean judgment
+    4. Calculate scores:
+       - Overall score across all criteria
+       - Example-level tag scores (e.g., all criteria tagged "diagnosis")
+       - Rubric-level tag scores (e.g., all "safety" criteria)
+    5. Aggregate with clipped mean and bootstrap std
+
+    Key Differences from Other Evals:
+    - Uses a separate grader model (GPT-4.1) instead of exact match
+    - Parallel grading of rubric items for efficiency
+    - Complex scoring with positive and negative criteria
+    - Support for evaluating human physician completions as baselines
+
+    Dataset Structure:
+    Each example contains:
+    - prompt: List of messages (user question, context, etc.)
+    - rubrics: List of RubricItem objects
+    - example_tags: List of tags for the overall question
+    - prompt_id: Unique identifier
+    - (Optional) ideal_completions_data: Physician-written answers
+    """
+
     def __init__(
         self,
         grader_model: SamplerBase,
         num_examples: int | None = None,
         n_repeats: int = 1,
-        # If set, evaluate human completions or reference completions instead of model completions.
+        # If set, evaluate human completions or reference completions instead of model completions
         physician_completions_mode: str | None = None,
-        # If True, run the grader on reference completions used by physicians, and physician_completions_mode must be set.
+        # If True, run the grader on reference completions used by physicians
+        # (requires physician_completions_mode to be set to a mode with references)
         run_reference_completions: bool = False,
         n_threads: int = 120,
         subset_name: Literal["hard", "consensus"] | None = None,
     ):
+        """
+        Initialize HealthBench evaluation.
+
+        Args:
+            grader_model: Sampler for grading responses (typically GPT-4.1)
+            num_examples: If set, sample this many examples. If None, use all.
+            n_repeats: Number of times to repeat each example (default: 1)
+            physician_completions_mode: If set, evaluate physician completions
+                instead of model completions. Options:
+                - "Group 1": No reference (physicians wrote from scratch)
+                - "Group 2": With Aug 2024 model references
+                - "Group 3": With Apr 2025 model references
+            run_reference_completions: If True, evaluate the reference completions
+                shown to physicians (only valid for Groups 2 and 3)
+            n_threads: Number of parallel threads for grading
+            subset_name: Dataset variant to use:
+                - None: Full HealthBench dataset
+                - "hard": Challenging subset
+                - "consensus": High physician agreement subset
+        """
         if run_reference_completions:
             assert physician_completions_mode is not None, (
                 "physician_completions_mode must be provided if run_reference_completions is True"

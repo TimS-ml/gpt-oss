@@ -2,9 +2,57 @@
 
 """
 A self-contained **pure-Python 3.9+** utility for applying human-readable
-“pseudo-diff” patch files to a collection of text files.
+"pseudo-diff" patch files to a collection of text files.
 
 Source: https://cookbook.openai.com/examples/gpt4-1_prompting_guide
+
+Overview:
+---------
+This module enables the model to apply code changes by generating a custom patch format
+that is more forgiving than traditional unified diff. The patch format supports:
+- Adding new files
+- Deleting files
+- Updating existing files with fuzzy matching
+- Moving/renaming files
+
+Patch Format:
+-------------
+Patches are bounded by *** Begin Patch / *** End Patch markers and contain:
+- *** Add File: path/to/new/file.py
+  + line 1 of new file
+  + line 2 of new file
+
+- *** Delete File: path/to/old/file.py
+
+- *** Update File: path/to/existing/file.py
+  @@ optional context line for locating changes
+   unchanged line
+  -removed line
+  +added line
+   unchanged line
+  *** End of File (optional marker for end-of-file changes)
+
+Fuzzy Matching:
+---------------
+Unlike strict unified diff, this parser:
+1. Tries exact line matching first
+2. Falls back to rstrip() matching (ignoring trailing whitespace)
+3. Falls back to strip() matching (ignoring all leading/trailing whitespace)
+4. Can handle end-of-file markers for changes at file end
+This makes it more robust to model-generated patches that might have minor formatting issues.
+
+Integration with Model:
+-----------------------
+The model learns to generate patches in this format during training. When the model wants
+to modify code, it outputs a patch string which is then parsed and applied by this module.
+The forgiving nature of the parser helps handle imperfect model outputs.
+
+Safety:
+-------
+- Validates all file paths before applying changes
+- Raises DiffError for any parsing or application issues
+- Does not modify files in-place until entire patch is validated
+- Supports custom open/write/remove functions for sandboxing
 """
 
 from __future__ import annotations
@@ -26,6 +74,13 @@ from typing import (
 #  Domain objects
 # --------------------------------------------------------------------------- #
 class ActionType(str, Enum):
+    """
+    The type of change being made to a file.
+
+    - ADD: Creating a new file
+    - DELETE: Removing an existing file
+    - UPDATE: Modifying an existing file (with optional move/rename)
+    """
     ADD = "add"
     DELETE = "delete"
     UPDATE = "update"
@@ -33,6 +88,19 @@ class ActionType(str, Enum):
 
 @dataclass
 class FileChange:
+    """
+    Represents a single file modification in a commit.
+
+    This is the final, validated representation of a change after parsing.
+    It contains the actual file contents (before and after) rather than
+    just the delta.
+
+    Attributes:
+        type: The kind of change (ADD, DELETE, or UPDATE)
+        old_content: Original file content (for DELETE and UPDATE)
+        new_content: New file content (for ADD and UPDATE)
+        move_path: If set, the file should be moved/renamed to this path (UPDATE only)
+    """
     type: ActionType
     old_content: Optional[str] = None
     new_content: Optional[str] = None
@@ -41,6 +109,15 @@ class FileChange:
 
 @dataclass
 class Commit:
+    """
+    A collection of file changes that should be applied atomically.
+
+    The keys are file paths, and values are FileChange objects describing
+    what to do with each file.
+
+    Attributes:
+        changes: Dict mapping file paths to their respective changes
+    """
     changes: Dict[str, FileChange] = field(default_factory=dict)
 
 
@@ -48,7 +125,15 @@ class Commit:
 #  Exceptions
 # --------------------------------------------------------------------------- #
 class DiffError(ValueError):
-    """Any problem detected while parsing or applying a patch."""
+    """
+    Raised when there's a problem parsing or applying a patch.
+
+    This includes:
+    - Malformed patch syntax
+    - Missing required files
+    - Context lines that can't be found
+    - Invalid file operations (e.g., adding a file that already exists)
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +141,18 @@ class DiffError(ValueError):
 # --------------------------------------------------------------------------- #
 @dataclass
 class Chunk:
+    """
+    Represents a contiguous block of changes within a file.
+
+    A chunk describes a location in the original file where lines should be
+    removed and/or inserted. The orig_index is determined during parsing by
+    finding the context lines in the original file.
+
+    Attributes:
+        orig_index: Line number in original file where this chunk applies
+        del_lines: Lines to remove from the original file
+        ins_lines: Lines to insert in their place
+    """
     orig_index: int = -1
     del_lines: List[str] = field(default_factory=list)
     ins_lines: List[str] = field(default_factory=list)
@@ -63,6 +160,17 @@ class Chunk:
 
 @dataclass
 class PatchAction:
+    """
+    Intermediate representation of a file operation during parsing.
+
+    This gets converted to a FileChange after all chunks are applied.
+
+    Attributes:
+        type: The kind of change (ADD, DELETE, or UPDATE)
+        new_file: Complete content for ADD actions
+        chunks: List of Chunk objects for UPDATE actions
+        move_path: Target path for move/rename operations
+    """
     type: ActionType
     new_file: Optional[str] = None
     chunks: List[Chunk] = field(default_factory=list)
@@ -71,6 +179,15 @@ class PatchAction:
 
 @dataclass
 class Patch:
+    """
+    Collection of PatchActions parsed from patch text.
+
+    This is an intermediate representation that gets converted to a Commit
+    after validation and chunk application.
+
+    Attributes:
+        actions: Dict mapping file paths to their respective PatchActions
+    """
     actions: Dict[str, PatchAction] = field(default_factory=dict)
 
 
@@ -79,6 +196,27 @@ class Patch:
 # --------------------------------------------------------------------------- #
 @dataclass
 class Parser:
+    """
+    State machine for parsing patch text into a Patch object.
+
+    The parser maintains an index into the lines of the patch file and
+    incrementally builds up PatchActions as it encounters directives like
+    "*** Add File" or "*** Update File".
+
+    Fuzzy Matching:
+    The parser tracks a "fuzz" score indicating how much fuzzy matching was
+    required. Higher fuzz means the patch was less precise:
+    - 0: Exact match
+    - 1-99: Whitespace differences (rstrip/strip matching)
+    - 10000+: End-of-file context found in wrong location
+
+    Attributes:
+        current_files: Dict of existing files (path -> content) for validation
+        lines: The patch text split into lines
+        index: Current line being parsed
+        patch: The Patch object being built
+        fuzz: Accumulated fuzz score from fuzzy matching
+    """
     current_files: Dict[str, str]
     lines: List[str]
     index: int = 0
@@ -87,13 +225,23 @@ class Parser:
 
     # ------------- low-level helpers -------------------------------------- #
     def _cur_line(self) -> str:
+        """
+        Returns the current line being parsed.
+
+        Raises:
+            DiffError: If we've reached the end of the patch unexpectedly
+        """
         if self.index >= len(self.lines):
             raise DiffError("Unexpected end of input while parsing patch")
         return self.lines[self.index]
 
     @staticmethod
     def _norm(line: str) -> str:
-        """Strip CR so comparisons work for both LF and CRLF input."""
+        """
+        Normalize line endings for cross-platform compatibility.
+
+        Strip CR so comparisons work for both LF and CRLF input.
+        """
         return line.rstrip("\r")
 
     # ------------- scanning convenience ----------------------------------- #
@@ -246,32 +394,76 @@ class Parser:
 def find_context_core(
     lines: List[str], context: List[str], start: int
 ) -> Tuple[int, int]:
+    """
+    Find where a list of context lines appears in the file using fuzzy matching.
+
+    This function implements a three-tier matching strategy:
+    1. Try exact match first (returns fuzz=0)
+    2. Try rstrip() match (ignoring trailing whitespace, returns fuzz=1)
+    3. Try strip() match (ignoring all whitespace, returns fuzz=100)
+
+    Args:
+        lines: The file content as a list of lines
+        context: The context lines to find
+        start: The index to start searching from
+
+    Returns:
+        Tuple of (line_index, fuzz_score) where:
+        - line_index: Index where context was found (-1 if not found)
+        - fuzz_score: How fuzzy the match was (0=exact, 1=rstrip, 100=strip)
+    """
     if not context:
         return start, 0
 
+    # Try exact match first (best case)
     for i in range(start, len(lines)):
         if lines[i : i + len(context)] == context:
             return i, 0
+
+    # Try rstrip match (ignoring trailing whitespace)
     for i in range(start, len(lines)):
         if [s.rstrip() for s in lines[i : i + len(context)]] == [
             s.rstrip() for s in context
         ]:
             return i, 1
+
+    # Try strip match (ignoring all leading/trailing whitespace)
     for i in range(start, len(lines)):
         if [s.strip() for s in lines[i : i + len(context)]] == [
             s.strip() for s in context
         ]:
             return i, 100
+
+    # Not found
     return -1, 0
 
 
 def find_context(
     lines: List[str], context: List[str], start: int, eof: bool
 ) -> Tuple[int, int]:
+    """
+    Find context lines with special handling for end-of-file markers.
+
+    When eof=True, the context is expected to be at the end of the file.
+    We first try to find it there, and if that fails, we search from the
+    start position but add a large fuzz penalty (10000) to indicate the
+    EOF marker was in the wrong place.
+
+    Args:
+        lines: The file content as a list of lines
+        context: The context lines to find
+        start: The index to start searching from
+        eof: Whether this context should be at end-of-file
+
+    Returns:
+        Tuple of (line_index, fuzz_score)
+    """
     if eof:
+        # For EOF context, try to find it at the end of the file first
         new_index, fuzz = find_context_core(lines, context, len(lines) - len(context))
         if new_index != -1:
             return new_index, fuzz
+        # If not found at EOF, search from start but add large fuzz penalty
         new_index, fuzz = find_context_core(lines, context, start)
         return new_index, fuzz + 10_000
     return find_context_core(lines, context, start)
@@ -280,6 +472,25 @@ def find_context(
 def peek_next_section(
     lines: List[str], index: int
 ) -> Tuple[List[str], List[Chunk], int, bool]:
+    """
+    Parse a section of an update patch to extract context lines and change chunks.
+
+    This function reads lines marked with ' ' (context), '-' (delete), or '+' (insert)
+    until it hits a section boundary (@@, ***, or end of input). It builds up:
+    - Context lines (the "old" version including deleted lines)
+    - Chunks of insertions/deletions
+
+    Args:
+        lines: The full patch text as a list of lines
+        index: The starting index for this section
+
+    Returns:
+        Tuple of (context, chunks, end_index, is_eof) where:
+        - context: List of context lines (what the file should look like before changes)
+        - chunks: List of Chunk objects describing the changes
+        - end_index: Index where this section ends
+        - is_eof: True if this section ends with *** End of File marker
+    """
     old: List[str] = []
     del_lines: List[str] = []
     ins_lines: List[str] = []
@@ -497,16 +708,70 @@ def remove_file(path: str) -> None:
 def apply_patch(
     text: str,
     open_fn: Callable[[str], str] = open_file,
-    write_fn: Callable[[str, str], None] = write_file, 
+    write_fn: Callable[[str, str], None] = write_file,
     remove_fn: Callable[[str], None] = remove_file,
 ) -> str:
+    """
+    Main entry point: parse and apply a patch to the filesystem.
+
+    This function orchestrates the entire patching process:
+    1. Validates the patch has proper *** Begin Patch / *** End Patch markers
+    2. Identifies which files need to be read (for UPDATE and DELETE operations)
+    3. Loads those files from disk
+    4. Parses the patch text into a structured Patch object
+    5. Converts the Patch to a Commit with fully-resolved file contents
+    6. Applies the commit to the filesystem
+
+    Args:
+        text: The patch text starting with "*** Begin Patch"
+        open_fn: Function to read files (path -> content)
+        write_fn: Function to write files (path, content -> None)
+        remove_fn: Function to delete files (path -> None)
+
+    Returns:
+        "Done!" on success
+
+    Raises:
+        DiffError: If the patch is malformed or can't be applied
+
+    Integration with Model:
+    -----------------------
+    The model learns to generate patches in the expected format during training.
+    When the model wants to make code changes, it outputs a patch which is then
+    passed to this function for execution. The custom open/write/remove functions
+    allow sandboxing the file operations if needed.
+
+    Example Patch:
+    --------------
+    *** Begin Patch
+    *** Add File: new_file.py
+    +def hello():
+    +    print("Hello, world!")
+    *** Update File: existing_file.py
+    @@ import sys
+     import sys
+    +import os
+
+    *** End Patch
+    """
     if not text.startswith("*** Begin Patch"):
         raise DiffError("Patch text must start with *** Begin Patch")
+
+    # Identify files that need to be read (UPDATE and DELETE require existing content)
     paths = identify_files_needed(text)
+
+    # Load the current content of those files
     orig = load_files(paths, open_fn)
+
+    # Parse the patch text into a Patch object with fuzzy matching
     patch, _fuzz = text_to_patch(text, orig)
+
+    # Convert Patch to Commit (resolves all chunks into full file contents)
     commit = patch_to_commit(patch, orig)
+
+    # Apply the commit to the filesystem
     apply_commit(commit, write_fn, remove_fn)
+
     return "Done!"
 
 

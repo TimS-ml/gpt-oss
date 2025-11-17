@@ -1,3 +1,35 @@
+/*
+ * matmul.metal
+ *
+ * High-performance matrix multiplication kernels for transformer models.
+ * Implements multiple specialized matmul variants optimized for different
+ * transformer components and data types.
+ *
+ * Kernel types:
+ * 1. Basic matmul: General purpose matrix-vector multiplication
+ * 2. QKV projection: Fused matmul + RoPE (Rotary Position Embeddings)
+ * 3. Unembedding: Matmul + argmax for token generation
+ * 4. Dense matmul: Simdgroup matrix operations for larger batches
+ *
+ * Data type optimizations:
+ * - Input activations: float32 for numerical accuracy
+ * - Weights: bfloat16 for memory bandwidth (2x reduction vs float32)
+ * - Bias: bfloat16 converted to float32 during accumulation
+ *
+ * Key GPU optimizations:
+ * - Simdgroup reductions for efficient parallel summation (32 threads)
+ * - Threadgroup memory for data reuse and intermediate results
+ * - Simdgroup matrix operations (8x8 tiles) for dense matmul
+ * - Fused operations to reduce memory traffic
+ * - Strided memory access for coalescing
+ *
+ * Performance characteristics:
+ * - Memory bandwidth bound (loading weights dominates)
+ * - High arithmetic intensity via blocking and tiling
+ * - Minimal synchronization within simdgroups
+ * - Threadgroup barriers only when necessary
+ */
+
 #include <metal_atomic>
 #include <metal_compute>
 #include <metal_integer>
@@ -11,13 +43,44 @@
 #pragma METAL fp contract(off)
 
 
-// Each simdgroup reduces all channels of the input and computes a single channel of the output
-// + Efficient synchronization
-// + Sequential memory access within a warp
-// Each threadgroup computes (simdgroups_per_threadgroup) consecutive output channels
-// + Reuse input vector from threadgroup memory
-// + Avoid synchronization across warps when doing reduction
-
+/**
+ * gptoss_f32_bf16w_matmul
+ *
+ * Basic matrix-vector multiplication: output = input * weight^T + bias
+ *
+ * Architecture:
+ * - Each simdgroup (32 threads) computes one output channel
+ * - Threads within simdgroup cooperatively reduce across input dimension
+ * - Each threadgroup processes multiple consecutive output channels
+ *
+ * Thread organization:
+ * - 2D grid: X = output channels (in simdgroup units), Y = batch/sequence
+ * - Simdgroups within threadgroup process independent output channels
+ * - Threads within simdgroup perform parallel reduction
+ *
+ * Memory access pattern:
+ * - Input: Sequential within simdgroup (coalesced reads)
+ * - Weights: Each simdgroup reads different row (sequential per simdgroup)
+ * - Output: One write per simdgroup (simd_is_first check)
+ *
+ * Optimization features:
+ * + Efficient simdgroup-level synchronization (no barriers needed)
+ * + Sequential/coalesced memory access for bandwidth efficiency
+ * + FMA operations for arithmetic efficiency
+ * + Optional accumulation mode (add to existing output vs overwrite)
+ *
+ * Parameters:
+ * @param args       Configuration (num_rows, num_column_vecs, add flag)
+ * @param input      Input activations [batch * embedding_dim] in float32
+ * @param weight     Weight matrix [output_dim * embedding_dim] in bfloat16
+ * @param bias       Bias vector [output_dim] in bfloat16
+ * @param output     Output activations [batch * output_dim] in float32
+ * @param control    Control structure for early termination
+ * @param gid        2D threadgroup position (X: output channels, Y: batch)
+ * @param simdgroup_tid    Thread index within simdgroup (0-31)
+ * @param simdgroup_idx    Simdgroup index within threadgroup
+ * @param num_simdgroups   Number of simdgroups per threadgroup
+ */
 kernel void gptoss_f32_bf16w_matmul(
     constant gptoss_matmul_args& args [[ buffer(0) ]],
     const device float4* input [[ buffer(1) ]],
@@ -31,42 +94,102 @@ kernel void gptoss_f32_bf16w_matmul(
     uint num_simdgroups [[simdgroups_per_threadgroup]])
 {
     const uint simdgroup_size = 32;
+
+    // Early exit if kernel has been signaled to abort
     if (control->abort != 0) {
         return;
     }
 
-    const uint num_column_vecs = args.num_column_vecs;
-    const uint row = gid.x * num_simdgroups + simdgroup_idx;
+    // Load configuration and compute output row index
+    const uint num_column_vecs = args.num_column_vecs;  // Input dimension / 4 (float4 vectors)
+    const uint row = gid.x * num_simdgroups + simdgroup_idx;  // Output channel index
 
+    // Position pointers for this batch element and output row
+    // Each thread in simdgroup starts at different position (tid) with stride of simdgroup_size
     input += gid.y * num_column_vecs + simdgroup_tid;
     weight += num_column_vecs * row + simdgroup_tid;
     bias += row;
     output += gid.y * args.num_rows + row;
 
+    // Calculate number of iterations (ceil division accounting for thread's starting position)
     uint num_iter = (num_column_vecs - simdgroup_tid + (simdgroup_size - 1)) / simdgroup_size;
 
+    // Phase 1: Parallel multiply-accumulate across input dimension
+    // Each thread accumulates partial sums using float4 SIMD operations
     float4 sum4 = 0.0f;
     do {
-        const bfloat4 w = *weight;
-        const float4 i = *input;
+        const bfloat4 w = *weight;  // Load 4 weights (convert from bfloat16)
+        const float4 i = *input;     // Load 4 input activations
+        // Fused multiply-add: sum4 = w * i + sum4 (efficient single instruction)
         sum4 = metal::fma(static_cast<float4>(w), i, sum4);
 
+        // Advance pointers by simdgroup stride for next iteration
         weight += simdgroup_size;
         input += simdgroup_size;
     } while (--num_iter != 0);
-    const float2 sum2 = sum4.xy + sum4.zw;
-    float sum = sum2.x + sum2.y;
+
+    // Phase 2: Reduce float4 to scalar (horizontal sum)
+    const float2 sum2 = sum4.xy + sum4.zw;  // Reduce 4 elements to 2
+    float sum = sum2.x + sum2.y;             // Reduce 2 elements to 1
+
+    // Phase 3: Simdgroup reduction (parallel reduction across 32 threads)
+    // Each thread has partial sum; simd_sum combines all 32 values
     sum = metal::simd_sum(sum);
+
+    // Phase 4: Write result (only first thread in simdgroup writes)
     if (metal::simd_is_first()) {
+        // Add bias term
         sum += static_cast<float>(*bias);
+        // Write to output (accumulate or overwrite based on args.add flag)
         if (args.add) {
-            *output += sum;
+            *output += sum;  // Accumulate mode (residual connections)
         } else {
-            *output = sum;
+            *output = sum;   // Overwrite mode (normal matmul)
         }
     }
 }
 
+/**
+ * gptoss_f32_bf16w_matmul_qkv
+ *
+ * Fused QKV projection + RoPE (Rotary Position Embeddings) for attention mechanism.
+ *
+ * This kernel combines multiple operations for efficiency:
+ * 1. Matrix multiplication to project input to Q, K, V spaces
+ * 2. RoPE (Rotary Position Embeddings) applied to Q and K
+ * 3. Writing K and V directly to KV cache in correct layout
+ *
+ * RoPE (Rotary Position Embeddings):
+ * - Encodes positional information through rotation in complex space
+ * - Applied to pairs of dimensions: [x, y] -> [x*cos(θ) - y*sin(θ), x*sin(θ) + y*cos(θ)]
+ * - Frequency decreases with dimension (high freq for early dims, low for later)
+ * - Supports YaRN (Yet another RoPE extensioN) for long context scaling
+ *
+ * Memory layout:
+ * - Q output: Sequential [batch * q_heads * head_dim]
+ * - KV cache: Transposed for efficient attention [heads * max_tokens * head_dim]
+ *
+ * Thread organization:
+ * - Similar to basic matmul but with fused RoPE computation
+ * - Uses threadgroup memory for intermediate matmul results
+ * - Simdgroup 0 performs RoPE and writes to final output
+ *
+ * Performance optimizations:
+ * - Fused operations reduce memory traffic (no separate RoPE pass)
+ * - Direct writes to KV cache avoid extra copy
+ * - Threadgroup memory for efficient data sharing
+ *
+ * Parameters:
+ * @param args       Configuration (embedding dim, token offset, RoPE parameters)
+ * @param input      Input activations [batch * embedding_dim]
+ * @param weight     QKV projection weights [(q_heads + 2*kv_heads) * head_dim * embedding_dim]
+ * @param bias       QKV projection bias [(q_heads + 2*kv_heads) * head_dim]
+ * @param q          Output Q projections [batch * q_heads * head_dim]
+ * @param kv         KV cache [kv_heads * max_tokens * 2 * head_dim]
+ * @param control    Control structure for early termination
+ * @param scratch    Threadgroup memory for intermediate results
+ * @param gid, simdgroup_tid, simdgroup_idx, num_simdgroups  Thread organization
+ */
 kernel void gptoss_f32_bf16w_matmul_qkv(
     constant gptoss_qkv_args& args [[ buffer(0) ]],
     const device float4* input [[ buffer(1) ]],
@@ -155,6 +278,28 @@ kernel void gptoss_f32_bf16w_matmul_qkv(
     }
 }
 
+/**
+ * gptoss_f32_bf16w_unembedding
+ *
+ * Unembedding layer for language model token prediction.
+ * Computes logits for all vocabulary tokens and tracks argmax for sampling.
+ *
+ * Operations:
+ * 1. Matrix-vector multiplication: logits = hidden_state * embedding_weights^T
+ * 2. Track maximum logit value and its index across threadgroups
+ * 3. Use atomic operations to find global maximum
+ *
+ * Argmax tracking optimization:
+ * - Encodes (token_id, logit_value) as single uint64 for atomic min/max
+ * - Converts float to sortable integer representation (handles sign bit)
+ * - Uses atomic_min to find maximum value (via bit manipulation)
+ *
+ * Thread organization:
+ * - Each simdgroup processes multiple rows (vocab tokens)
+ * - Loop over assigned rows, computing one logit per iteration
+ * - Threadgroup reduction to find local argmax
+ * - Atomic operation for global argmax
+ */
 kernel void gptoss_f32_bf16w_unembedding(
     constant gptoss_unembedding_args& args [[ buffer(0) ]],
     const device float4* input [[ buffer(1) ]],
@@ -233,10 +378,34 @@ kernel void gptoss_f32_bf16w_unembedding(
     }
 }
 
-// Current constraints for the dense matmul kernel:
-//  1- All B* and Sg_* are a multiple of 8.
-//  2- Bm is divisible by Sg_n and Bn is divisible by Sg_n.
-//  3- M, N and K are all divisible by 8..
+/**
+ * _gptoss_f32_bf16w_dense_matmul_impl
+ *
+ * Template implementation for dense matrix-matrix multiplication using simdgroup matrix operations.
+ * Optimized for larger batch sizes where matrix-matrix ops are more efficient than matrix-vector.
+ *
+ * Algorithm: Blocked/tiled matrix multiplication
+ * - Divides output matrix into threadgroup tiles (Bm x Bn)
+ * - Further divides into simdgroup tiles (Sg_Bm x Sg_Bn)
+ * - Uses hardware-accelerated 8x8 matrix multiply-accumulate (simdgroup_multiply_accumulate)
+ * - Processes K dimension in chunks of Bk
+ *
+ * Template parameters:
+ * - Bm, Bn, Bk: Threadgroup tile sizes for M, N, K dimensions
+ * - Sg_Bm, Sg_Bn: Simdgroup tile sizes for M, N dimensions
+ * - add: If 1, accumulate into output; if 0, overwrite
+ *
+ * Performance optimizations:
+ * - Simdgroup matrix operations (8x8 tiles) for high throughput
+ * - Threadgroup memory for accumulating results before final write
+ * - Fully unrolled loops for minimal overhead
+ * - Blocked computation for good cache reuse
+ *
+ * Constraints:
+ * - All tile sizes (B*, Sg_*) must be multiples of 8 (for 8x8 matrix ops)
+ * - Bm divisible by Sg_Bm, Bn divisible by Sg_Bn (for even tiling)
+ * - M, N, K divisible by 8 (for aligned loads)
+ */
 template <uint Bm, uint Bn, uint Bk, uint Sg_Bm, uint Sg_Bn, uint add = 0>
 inline void _gptoss_f32_bf16w_dense_matmul_impl(
     constant gptoss_dense_matmul_args& args, const device float* lhs,

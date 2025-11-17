@@ -1,3 +1,35 @@
+/*
+ * moematmul.metal
+ *
+ * Specialized matrix multiplication kernels for Mixture of Experts (MoE) layers.
+ * Implements fused operations for MoE MLPs including:
+ * - Quantized weight dequantization (MF4)
+ * - Matrix multiplication
+ * - SwiGLU activation function
+ *
+ * MoE Architecture:
+ * - Each token is processed by multiple experts (typically top-2 or top-4)
+ * - Experts are specialized FFN/MLP networks
+ * - This kernel processes gate and up projections with fused SwiGLU
+ *
+ * SwiGLU Activation:
+ * SwiGLU(x) = (xW_gate ⊙ swish(xW_up))
+ * where swish(x) = x * sigmoid(x) = x / (1 + exp(-x))
+ * and ⊙ denotes element-wise multiplication
+ *
+ * Key optimizations:
+ * - Fused MF4 dequantization and matmul (no separate dequant pass)
+ * - Inline SwiGLU computation (no separate activation pass)
+ * - Expert-specific weight access with strided layout
+ * - Simdgroup reductions for efficient parallel summation
+ * - Processes gate and up projections together
+ *
+ * Thread organization:
+ * - Each simdgroup computes one output channel
+ * - Threadgroups process multiple consecutive output channels
+ * - 3D grid: X = output channels, Y = tokens, Z = expert index
+ */
+
 #include <internal/kernel-args.h>
 #include <metal_common>
 #include <metal_compute>
@@ -9,13 +41,26 @@
 #pragma METAL fp contract(off)
 #define ceil_div(a, b) (((a) + (b) - 1) / (b))
 
-// Each simdgroup reduces all channels of the input and computes a single channel of the output
-// + Efficient synchronization
-// + Sequential memory access within a warp
-// Each threadgroup computes (simdgroups_per_threadgroup) consecutive output channels
-// + Reuse input vector from threadgroup memory
-// + Avoid synchronization across warps when doing reduction
-
+/**
+ * gptoss_f32_mf4w_moe_matmul_swiglu
+ *
+ * Fused MoE MLP gate/up projection with SwiGLU activation.
+ *
+ * Combines three operations:
+ * 1. Dequantize MF4 weights to float32
+ * 2. Matrix multiplication: output = input * weights^T + bias
+ * 3. SwiGLU activation (for gate/up projections)
+ *
+ * Memory layout:
+ * - Weights stored in expert-specific sections (expert_stride apart)
+ * - Each expert has independent weight matrices
+ * - Output also expert-specific for parallel expert execution
+ *
+ * Performance:
+ * - Inline dequantization saves memory bandwidth
+ * - Fused SwiGLU eliminates intermediate storage
+ * - Simdgroup parallelism for efficient reduction
+ */
 kernel void gptoss_f32_mf4w_moe_matmul_swiglu(
     constant gptoss_moe_matmul_swiglu_args& args [[ buffer(0) ]],
     const device float4* input [[ buffer(1) ]],

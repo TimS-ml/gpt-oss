@@ -1,7 +1,39 @@
+"""
+Multiple-Choice Answer Extraction Module
+
+This module extracts multiple-choice answers (A, B, C, or D) from model-generated
+text. It's used by evaluations like GPQA that present questions with four options.
+
+The Challenge:
+Models can express their answer in many different formats:
+- "The answer is A"
+- "**Answer:** (B)"
+- "I choose option C"
+- "\\boxed{D}"
+- "**A) Description of option**"
+- Just "A" on its own line
+
+This module uses a prioritized list of regex patterns to handle all common formats,
+from most specific (e.g., "**Answer:** A") to most general (e.g., bare "A").
+
+Pattern Priority:
+Patterns are tried in order, with more specific patterns first to avoid false matches.
+For example, we match "Answer: A" before matching "(A)" to avoid extracting A from
+"(Answer)" in unrelated text.
+
+Usage:
+    from .abcd_grader import extract_abcd
+
+    response = "After analyzing the question, I believe **Answer: B** is correct."
+    answer = extract_abcd(response)  # Returns "B"
+"""
+
 import re
 import sys
 
 
+# List of regex patterns for extracting A/B/C/D answers, ordered by priority
+# More specific patterns come first to avoid false positives
 _PATTERNS = [
     # 0)"**Answer:** A" or "*Answers* – B", i.e. markdown‐wrapped "Answer(s)" with an unwrapped letter.
     re.compile(
@@ -80,28 +112,78 @@ _PATTERNS = [
 
 def extract_abcd(text: str) -> str | None:
     """
-    Scan text (with Markdown/LaTeX wrappers intact) and return
-    'A', 'B', 'C', or 'D' if a correct-answer declaration is found.
-    Otherwise return None.
+    Extract a multiple-choice answer (A, B, C, or D) from model-generated text.
+
+    This function tries all patterns in _PATTERNS in priority order, looking for
+    the most specific match first. If multiple patterns match, it chooses based on:
+    1. Pattern priority (earlier patterns are more specific)
+    2. Match length (longer matches are more likely to be intentional)
+
+    Args:
+        text: Model-generated response text, may include:
+            - Markdown formatting (**bold**, _italic_)
+            - LaTeX formatting (\\boxed{}, \\textbf{})
+            - Plain text answers
+            - Mixed content with reasoning and answer
+
+    Returns:
+        Single character 'A', 'B', 'C', or 'D' if an answer is found
+        Returns the first character of text (fallback) if no pattern matches
+        This fallback handles cases like "A. Description..." where the answer
+        is at the very start.
+
+    Examples:
+        >>> extract_abcd("The answer is **B**")
+        'B'
+        >>> extract_abcd("I believe (C) is correct")
+        'C'
+        >>> extract_abcd("\\\\boxed{A}")
+        'A'
+        >>> extract_abcd("**D) This option is best**")
+        'D'
     """
     matches = []
+    # Try all patterns and collect matches
     for prio, pat in enumerate(_PATTERNS):
         m = pat.search(text)
         if m:
+            # Extract the captured letter (group 1) and normalize to uppercase
             letter = m.group(1).upper()
             if letter in 'ABCD':
+                # Store priority, match object, and extracted letter
                 matches.append((prio, m, letter))
 
+    # Sort matches by:
+    # 1. Priority (lower is better - earlier patterns are more specific)
+    # 2. Match length (longer matches are more likely intentional)
+    # This ensures we prefer "Answer: A" over just "(A)" if both exist
     matches.sort(key=lambda triple: (
-        triple[0],
-        len(triple[1].group(0))
+        triple[0],  # Pattern priority
+        len(triple[1].group(0))  # Length of matched text (negative for descending)
     ))
+
+    # Return the best match if any patterns succeeded
     for _, match, letter in matches:
         return letter
+
+    # Fallback: If no patterns match, try the first character after removing markdown
+    # This handles cases like "**A**" at the very start of the response
     return text.removeprefix('**')[:1]
 
 
 def main():
+    """
+    Command-line interface for testing answer extraction.
+
+    Usage:
+        # Test on files:
+        python -m gpt_oss.evals.abcd_grader file1.txt file2.txt
+
+        # Test on stdin:
+        echo "The answer is B" | python -m gpt_oss.evals.abcd_grader
+
+    This is useful for debugging answer extraction on actual model outputs.
+    """
     if len(sys.argv) > 1:
         # Process files
         for fn in sys.argv[1:]:

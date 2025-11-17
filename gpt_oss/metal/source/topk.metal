@@ -1,3 +1,32 @@
+/*
+ * topk.metal
+ *
+ * Top-K selection with softmax for Mixture of Experts (MoE) routing.
+ * Selects the top K experts for each token and computes softmax scores.
+ *
+ * MoE Routing:
+ * - Each token is scored against all experts
+ * - Top K experts are selected (typically K=2 or K=4)
+ * - Softmax computed over selected experts for weighted combination
+ * - Expert IDs and normalized scores used for routing
+ *
+ * Algorithm:
+ * 1. Find top K maximum values and their indices via simdgroup operations
+ * 2. Compute softmax over selected K values
+ * 3. Output expert IDs and normalized scores
+ *
+ * Variants:
+ * - topk_e128_k4: 128 experts, top-4 selection
+ * - topk_e32_k4: 32 experts, top-4 selection
+ *
+ * Key optimizations:
+ * - Simdgroup-level parallel max/min operations
+ * - Iterative selection (find max, mask it out, repeat)
+ * - Single simdgroup per token (32 threads)
+ * - Numerically stable softmax (subtract max before exp)
+ * - Minimal memory access (all in registers)
+ */
+
 #include <metal_compute>
 #include <metal_integer>
 #include <metal_math>
@@ -9,6 +38,36 @@
 #pragma METAL fp contract(off)
 
 
+/**
+ * gptoss_f32_topk_softmax_e128_k4
+ *
+ * Top-4 expert selection from 128 experts with softmax normalization.
+ *
+ * Thread organization:
+ * - Single simdgroup (32 threads) per token
+ * - Each thread handles 4 expert scores (128 total / 32 threads = 4 per thread)
+ * - Parallel selection using simd_max and simd_min operations
+ *
+ * Selection algorithm (repeated 4 times for K=4):
+ * 1. Each thread finds local max among its 4 values
+ * 2. simd_max finds global max across simdgroup
+ * 3. simd_min finds which thread/index has the max (for uniqueness)
+ * 4. Mask out selected value with -INFINITY
+ * 5. Repeat for next top value
+ *
+ * Softmax computation:
+ * - Subtract top value for numerical stability
+ * - Compute exp for each of 4 selected values
+ * - Normalize by sum of exps
+ *
+ * Parameters:
+ * @param args     Configuration (not used, for API consistency)
+ * @param input    Expert scores [tokens * 128] in float4 format
+ * @param output   Expert predictions [tokens * 4] with IDs and scores
+ * @param control  Control structure for early termination
+ * @param gid      Threadgroup/token index
+ * @param tid      Thread index within simdgroup (0-31)
+ */
 [[max_total_threads_per_threadgroup(32)]]
 kernel void gptoss_f32_topk_softmax_e128_k4(
     constant gptoss_topk_args& args [[ buffer(0) ]],

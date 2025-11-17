@@ -1,3 +1,32 @@
+/*
+ * sample.metal
+ *
+ * Metal kernels for token sampling in language model generation.
+ * Implements temperature-scaled softmax and efficient categorical sampling
+ * for next-token prediction.
+ *
+ * Token Generation Pipeline:
+ * 1. Model produces logits (unnormalized scores) for all vocabulary tokens
+ * 2. Softmax converts logits to probability distribution
+ * 3. Sampling selects next token based on probabilities
+ *
+ * Kernels:
+ * - gptoss_f32_softmax: Numerically stable softmax with temperature scaling
+ * - gptoss_f32_sample: Efficient categorical sampling using prefix sums
+ *
+ * Key optimizations:
+ * - Numerically stable softmax (subtract max to avoid overflow)
+ * - Blocked processing for large vocabularies
+ * - Simdgroup and threadgroup reductions
+ * - Binary search using parallel prefix sums
+ * - Single random number generation for deterministic sampling
+ *
+ * Performance characteristics:
+ * - Softmax: Two passes (find max, compute exp and sum)
+ * - Sampling: Iterative search with parallel prefix sums
+ * - Minimal synchronization (simdgroup ops are warp-synchronous)
+ */
+
 #include <metal_compute>
 #include <metal_integer>
 #include <metal_math>
@@ -9,6 +38,12 @@
 #pragma METAL fp contract(off)
 
 
+/**
+ * rng_squares32
+ *
+ * Squares random number generator for sampling.
+ * See random.metal for detailed documentation.
+ */
 inline static uint rng_squares32(ulong offset, ulong seed) {
     const ulong y = offset * seed;
     const ulong z = y + seed;
@@ -30,6 +65,42 @@ inline static uint rng_squares32(ulong offset, ulong seed) {
     return as_type<uint2>(x).y;
 }
 
+/**
+ * gptoss_f32_softmax
+ *
+ * Numerically stable softmax with temperature scaling for token probabilities.
+ *
+ * Algorithm: Softmax(x) = exp(x / T) / sum(exp(x / T))
+ * where T is temperature parameter controlling randomness.
+ *
+ * Numerical stability:
+ * - Subtract max value before exp() to prevent overflow
+ * - Implemented as: exp((x - max) / T) / sum(exp((x - max) / T))
+ *
+ * Temperature effects:
+ * - T < 1: Sharpens distribution (more deterministic)
+ * - T = 1: Standard softmax
+ * - T > 1: Flattens distribution (more random)
+ *
+ * Implementation:
+ * - Maximum value already computed by unembedding kernel
+ * - Processes vocabulary in blocks (one threadgroup per block)
+ * - Each threadgroup computes partial sum of exp values
+ * - Simdgroup and threadgroup reductions for efficiency
+ *
+ * Thread organization:
+ * - 2D grid: X = blocks, Y = batch
+ * - Each threadgroup processes one block of vocabulary
+ * - Threads cooperate via simdgroup and threadgroup memory
+ *
+ * Parameters:
+ * @param args       Configuration (num_vecs, num_vecs_per_threadgroup, temperature)
+ * @param score      Input logits (unnormalized scores)
+ * @param argmax     Maximum logit value and index (from unembedding)
+ * @param prob       Output probabilities (exp values, not yet normalized)
+ * @param sum        Per-block sums of exp values (for normalization)
+ * @param control    Control structure for early termination
+ */
 kernel void gptoss_f32_softmax(
     constant gptoss_softmax_args& args [[ buffer(0) ]],
     const device float* score [[ buffer(1) ]],
@@ -84,6 +155,42 @@ kernel void gptoss_f32_softmax(
     }
 }
 
+/**
+ * gptoss_f32_sample
+ *
+ * Efficient categorical sampling from probability distribution.
+ *
+ * Algorithm:
+ * 1. Generate random value in [0, 1) using RNG
+ * 2. Scale by total probability sum to get target CDF value
+ * 3. Find token whose cumulative probability exceeds target
+ * 4. Use parallel prefix sums for fast search
+ *
+ * Implementation strategy:
+ * - Two-level search: First find block, then find token within block
+ * - Parallel prefix sums computed using simdgroup and threadgroup ops
+ * - Binary-search-like approach using parallel comparisons
+ * - All threads participate for uniform control flow
+ *
+ * Thread organization:
+ * - Single threadgroup (up to 1024 threads)
+ * - All threads cooperate to find sampled token
+ * - Uses threadgroup memory for partial sums
+ * - Synchronized with barriers for correctness
+ *
+ * Performance notes:
+ * - Iterative algorithm: continues until token found
+ * - Each iteration processes batch of candidates
+ * - Uses simd_min/simd_max for fast parallel reductions
+ * - Deterministic: same seed produces same token
+ *
+ * Parameters:
+ * @param args         Configuration (num_dims, num_blocks, rng_seed, rng_offset)
+ * @param prob         Probability distribution (exp values from softmax)
+ * @param sum          Per-block sums of probabilities
+ * @param prediction   Output: sampled token ID
+ * @param control      Control structure for early termination
+ */
 [[max_total_threads_per_threadgroup(1024)]]
 kernel void gptoss_f32_sample(
     constant gptoss_sample_args& args [[ buffer(0) ]],

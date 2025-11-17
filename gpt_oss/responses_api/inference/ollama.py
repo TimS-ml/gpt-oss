@@ -1,7 +1,34 @@
 """
-NOTE: this is a stitched together implementation that uses Ollama for inference. It's primarily used
-for testing and development. It does not leverage any prompt caching or other optimizations and
-can therefore be slow between turns.
+Ollama inference backend for the Responses API.
+
+This backend connects to a locally running Ollama service to perform inference.
+Ollama (https://ollama.ai) is a tool that makes it easy to run LLMs locally.
+
+Features:
+- Works with any model supported by Ollama
+- Streaming text generation from Ollama
+- Token-level streaming via background thread
+- Automatic timeout and error handling
+
+Limitations:
+- Does NOT use prompt caching (each request is independent)
+- Can be slow between conversation turns
+- Requires Ollama service running on localhost:11434
+- Token-by-token streaming adds some overhead
+
+This backend is primarily for:
+- Testing and development
+- Running alternative models via Ollama
+- Quick prototyping without GPU access
+
+Usage:
+    # First, start Ollama and pull a model:
+    ollama pull mistral
+
+    # Then start the server:
+    python -m gpt_oss.responses_api.serve --inference-backend ollama --checkpoint mistral
+
+Note: The checkpoint parameter should be the Ollama model name (e.g., "mistral", "llama2")
 """
 
 import json
@@ -12,25 +39,35 @@ from typing import Callable, Optional
 import requests
 from openai_harmony import HarmonyEncodingName, load_harmony_encoding
 
-EOS_TOKEN = 200002  # only used on hard timeout
+EOS_TOKEN = 200002  # End-of-sequence token (used on hard timeout)
 
-# Tunables
-POLL_INTERVAL_S = 0.01  # 10ms between buffer checks
-CALL_MAX_WAIT_S = 0.250  # max time to block inside a single infer call
-NO_TOKEN_TIMEOUT_S = 15.0  # overall inactivity timeout before emitting EOS
-FIRST_BYTE_TIMEOUT_S = 30.0  # time to wait for first token before EOS
+# Configuration parameters
+POLL_INTERVAL_S = 0.01  # How often to check for new tokens (10ms)
+CALL_MAX_WAIT_S = 0.250  # Max time to wait in a single infer_next_token call (250ms)
+NO_TOKEN_TIMEOUT_S = 15.0  # Timeout for inactivity before returning EOS
+FIRST_BYTE_TIMEOUT_S = 30.0  # Timeout for first token from Ollama
 
-# Shared state
-_token_buffer: list[int] = []
-_buffer_lock = threading.Lock()
-_stream_thread: Optional[threading.Thread] = None
-_stream_done = threading.Event()
-_stream_error: Optional[Exception] = None
-_last_progress_ts: float = 0.0  # updated whenever we enqueue or dequeue tokens
-_previous_request_tokens: list[int] = []
+# Shared state (global variables for managing the streaming connection)
+_token_buffer: list[int] = []  # Queue of tokens received from Ollama
+_buffer_lock = threading.Lock()  # Protect token buffer from concurrent access
+_stream_thread: Optional[threading.Thread] = None  # Background thread for streaming
+_stream_done = threading.Event()  # Signals when streaming is complete
+_stream_error: Optional[Exception] = None  # Stores any error from the stream
+_last_progress_ts: float = 0.0  # Last time we made progress (enqueued/dequeued tokens)
+_previous_request_tokens: list[int] = []  # Previously processed tokens (unused currently)
 
 
 def lcp(cache: list[int], inp: list[int]) -> list[int]:
+    """
+    Find longest common prefix between two token sequences.
+
+    Args:
+        cache: Previously processed tokens
+        inp: New input tokens
+
+    Returns:
+        Common prefix of both sequences
+    """
     i = 0
     max_len = min(len(cache), len(inp))
     while i < max_len and cache[i] == inp[i]:
@@ -39,15 +76,18 @@ def lcp(cache: list[int], inp: list[int]) -> list[int]:
 
 
 def _now():
+    """Get current monotonic time in seconds."""
     return time.monotonic()
 
 
 def _touch_progress():
+    """Update the last progress timestamp to current time."""
     global _last_progress_ts
     _last_progress_ts = _now()
 
 
 def _reset_stream_state():
+    """Reset all streaming state for a new request."""
     global _token_buffer, _stream_thread, _stream_error
     with _buffer_lock:
         _token_buffer = []
@@ -58,10 +98,40 @@ def _reset_stream_state():
 
 
 def setup_model(checkpoint: str) -> Callable[[list[int], float, bool], int]:
+    """
+    Initialize the Ollama backend.
+
+    Creates an inference function that:
+    1. Decodes token IDs to text using Harmony encoding
+    2. Sends text to Ollama's /api/generate endpoint
+    3. Streams responses in a background thread
+    4. Re-tokenizes the streaming text into tokens
+    5. Returns tokens one at a time from a buffer
+
+    Args:
+        checkpoint: Ollama model name (e.g., "mistral", "llama2")
+
+    Returns:
+        Inference function ready for use by the API server
+    """
+    # Load Harmony tokenizer for encoding/decoding
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     model_name = checkpoint
 
     def _start_stream(token_ids: list[int], temperature: float):
+        """
+        Start streaming generation from Ollama in a background thread.
+
+        Decodes tokens to text, sends to Ollama, and accumulates the
+        streaming response back into tokens.
+
+        Args:
+            token_ids: Input tokens to decode and send
+            temperature: Sampling temperature
+
+        Returns:
+            Thread handle for the background stream
+        """
         prompt_text = encoding.decode(token_ids)
 
         def run():
